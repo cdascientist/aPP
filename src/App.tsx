@@ -53,6 +53,7 @@ export default function App() {
   const three_js_particle_system_ref = useRef<THREE.Points | null>(null);
   const animation_frame_request_id_generator = useRef<number | null>(null);
   const video_element_reference = useRef<HTMLVideoElement>(null);
+  const plyr_instance_ref = useRef<any>(null);
   const has_video_played_ref = useRef<boolean>(false);
   const video_finished_ref = useRef<boolean>(false);
 
@@ -62,15 +63,44 @@ export default function App() {
       set_app_lifecycle_phase('VIDEO_BLACKOUT');
   }, []);
 
-  // React's synthetic event system has NO onWebkitEndFullscreen.
-  // The only way to listen for iOS fullscreen-exit is addEventListener.
+  // Handle Plyr setup and clean up
   useEffect(() => {
-      const v = video_element_reference.current;
-      if (!v) return;
-      const handleWebkitEnd = () => complete_cinematic_sequence();
-      v.addEventListener('webkitendfullscreen', handleWebkitEnd);
-      return () => v.removeEventListener('webkitendfullscreen', handleWebkitEnd);
-  }, [complete_cinematic_sequence]);
+    if (!is_mobile_agent) return;
+
+    const video = video_element_reference.current;
+    if (!video || !(window as any).Plyr) return;
+
+    plyr_instance_ref.current = new (window as any).Plyr(video, {
+      controls: [],                              // no custom chrome
+      clickToPlay: false,
+      fullscreen: {
+        enabled: true,
+        iosNative: true,                         // ← THE critical option: use iOS native fullscreen player
+        fallback: true,
+      },
+      muted: false,
+      autoplay: false,
+      hideControls: true,
+    });
+
+    return () => {
+      try { plyr_instance_ref.current?.destroy(); } catch {}
+    };
+  }, [is_mobile_agent]);
+
+  // Hook Plyr's fullscreen-exit event
+  useEffect(() => {
+    if (!is_mobile_agent) return;
+
+    const plyr = plyr_instance_ref.current;
+    if (!plyr) return;
+    const onExit = () => complete_cinematic_sequence();
+    plyr.on('exitfullscreen', onExit);
+    plyr.on('ended', onExit);
+    return () => {
+      try { plyr.off('exitfullscreen', onExit); plyr.off('ended', onExit); } catch {}
+    };
+  }, [plyr_instance_ref.current, complete_cinematic_sequence, is_mobile_agent]);
 
   // Handle the seamless dark fade transition sequences
   useEffect(() => {
@@ -97,47 +127,22 @@ export default function App() {
   }, [app_lifecycle_phase]);
   
   const initiate_cinematic_sequence_via_trigger = () => {
+      const plyr = plyr_instance_ref.current;
       const video = video_element_reference.current;
-      if (!video) {
-          set_app_lifecycle_phase('VIDEO_BLACKOUT'); 
-          return;
-      }
+      
+      if (!video) { set_app_lifecycle_phase('VIDEO_BLACKOUT'); return; }
+      if (is_mobile_agent && !plyr) { set_app_lifecycle_phase('VIDEO_BLACKOUT'); return; }
 
       has_video_played_ref.current = true;
 
       if (is_mobile_agent) {
-          // ---- iOS PATH: native fullscreen player ----
-          const anyVideo = video as any;
-      
-          // 1. Unmute is allowed here because the click IS the gesture
+          set_app_lifecycle_phase('PLAYING_VIDEO');
+          // Plyr chains play + native iOS fullscreen inside the same gesture tick
           video.muted = false;
-      
-          // 2. Play first, synchronously, to consume the gesture for audio playback
-          const p = video.play();
-      
-          // 3. Call webkitEnterFullscreen SYNCHRONOUSLY in the same tick.
-          try {
-            if (typeof anyVideo.webkitEnterFullscreen === 'function') {
-                if (video.readyState >= 1) {
-                    anyVideo.webkitEnterFullscreen();
-                } else {
-                    // Metadata hasn't arrived; wait for it but keep this a ONE-SHOT
-                    const tryFs = () => {
-                        video.removeEventListener('loadedmetadata', tryFs);
-                        try { anyVideo.webkitEnterFullscreen(); } catch {}
-                    };
-                    video.addEventListener('loadedmetadata', tryFs);
-                }
-            }
-          } catch (e) {
-            console.warn('webkitEnterFullscreen failed:', e);
-          }
-      
-          if (p !== undefined) {
-            p.catch((err) => {
-                console.warn('play() rejected on iOS:', err);
-                complete_cinematic_sequence();
-            });
+          const p = plyr.play();
+          try { plyr.fullscreen.enter(); } catch (e) { console.warn(e); }
+          if (p && typeof p.catch === 'function') {
+              p.catch(() => complete_cinematic_sequence());
           }
       } else {
           // ---- DESKTOP PATH: inline playback with fallback ----
@@ -150,7 +155,7 @@ export default function App() {
           video.muted = false;
           
           const playPromise = video.play();
-
+          
           if (playPromise !== undefined) {
               playPromise.catch((err) => {
                   console.warn('play() rejected:', err);
@@ -162,10 +167,10 @@ export default function App() {
                   });
               });
           }
-      }
 
-      // Flip React state AFTER play() so the gesture reaches play() first
-      set_app_lifecycle_phase('PLAYING_VIDEO');
+          // Flip React state AFTER play() so the gesture reaches play() first
+          set_app_lifecycle_phase('PLAYING_VIDEO');
+      }
   };
   
   // precompiled heavy geometries cache to obliterate main-thread rendering lag on transitions
@@ -719,54 +724,68 @@ export default function App() {
       </AnimatePresence>
 
       {/* Persistent preloaded cinematic sequence layered perfectly above blackout transition */}
-      <video 
-        ref={(node) => {
-          if (video_element_reference.current !== node) {
-            video_element_reference.current = node;
-            if (node) {
-              node.setAttribute('muted', '');
-              node.defaultMuted = true;
-              node.muted = true;
-              if (!is_mobile_agent) {
-                node.setAttribute('playsinline', '');
-                node.setAttribute('webkit-playsinline', '');
+      {is_mobile_agent ? (
+        <video 
+          key="mobile-video"
+          ref={(node) => {
+              if (video_element_reference.current !== node) {
+                   video_element_reference.current = node;
               }
-              // Force metadata load so webkitEnterFullscreen won't throw INVALID_STATE_ERR
-              try { node.load(); } catch {}
-            }
-          }
-        }}
-        src={introVideo}
-        preload="auto"
-        autoPlay={false}
-        onEnded={complete_cinematic_sequence}
-        onError={() => {
-          if (app_lifecycle_phase === 'PLAYING_VIDEO') complete_cinematic_sequence();
-        }}
-        {...(is_mobile_agent ? {} : { playsInline: true })}
-        style={is_mobile_agent ? {
-          // 1x1 off-screen stub. iOS native player will cover the screen when fullscreen is entered.
-          position: 'fixed',
-          top: 0,
-          left: 0,
-          width: '1px',
-          height: '1px',
-          opacity: 0.01,            // NOT 0 — iOS won't load hidden videos (per WebKit policy)
-          pointerEvents: 'none',
-          zIndex: -1,
-        } : {
-          position: 'fixed',
-          inset: 0,
-          width: '100vw',
-          height: '100vh',
-          objectFit: 'cover',
-          zIndex: 50,
-          opacity: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 1 : 0,
-          pointerEvents: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 'auto' : 'none',
-          transition: 'opacity 0.3s ease-out',
-          backgroundColor: '#000',
-        }}
-      />
+          }}
+          src={introVideo}
+          preload="auto"
+          playsInline={false} /* CRITICAL on mobile — omit/false so iOS auto-fullscreens */
+          onEnded={complete_cinematic_sequence}
+          onError={() => {
+            if (app_lifecycle_phase === 'PLAYING_VIDEO') complete_cinematic_sequence();
+          }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            width: '100vw',
+            height: '100vh',
+            objectFit: 'cover',
+            zIndex: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 9999 : -1,  /* hide behind UI until playing */
+            opacity: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 1 : 0,
+            pointerEvents: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 'auto' : 'none',
+            backgroundColor: '#000',
+            transition: 'opacity 0.3s',
+          }}
+        />
+      ) : (
+        <div className="contents">
+          <video 
+            ref={(node) => {
+                video_element_reference.current = node;
+                if (node) {
+                    node.setAttribute('muted', '');
+                    node.setAttribute('playsinline', '');
+                    node.setAttribute('webkit-playsinline', ''); 
+                    node.defaultMuted = true;
+                    node.muted = true;
+                }
+            }}
+            src={introVideo}
+            preload="auto"
+            autoPlay={false}
+            playsInline={true}
+            muted={true}
+            onEnded={complete_cinematic_sequence}
+            onError={() => {
+                if (app_lifecycle_phase === 'PLAYING_VIDEO') {
+                    complete_cinematic_sequence();
+                }
+            }}
+            style={{ 
+              opacity: app_lifecycle_phase === 'PLAYING_VIDEO' || app_lifecycle_phase === 'AWAITING_TRIGGER' || app_lifecycle_phase === 'PRELOADING' ? 1 : 0, 
+              transition: 'opacity 0.1s ease-out', 
+              objectFit: 'cover', 
+              backgroundColor: '#000' 
+            }}
+            className={`fixed inset-0 z-[50] w-[100vw] h-[100vh] ${app_lifecycle_phase !== 'PLAYING_VIDEO' ? 'pointer-events-none' : ''}`}
+          />
+        </div>
+      )}
 
       {/* underlying three dimensional holographic representation canvas */}
       <motion.div 
