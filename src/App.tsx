@@ -55,17 +55,6 @@ export default function App() {
   const video_element_reference = useRef<HTMLVideoElement>(null);
   const has_video_played_ref = useRef<boolean>(false);
   const video_finished_ref = useRef<boolean>(false);
-  const metadata_ready_ref = useRef<boolean>(false);
-
-  useEffect(() => {
-    const v = video_element_reference.current;
-    if (!v) return;
-    const onMeta = () => { metadata_ready_ref.current = true; };
-    v.addEventListener('loadedmetadata', onMeta);
-    // Kick off metadata preload
-    v.load();
-    return () => v.removeEventListener('loadedmetadata', onMeta);
-  }, []);
 
   const complete_cinematic_sequence = React.useCallback(() => {
       if (video_finished_ref.current) return;
@@ -120,31 +109,35 @@ export default function App() {
           // ---- iOS PATH: native fullscreen player ----
           const anyVideo = video as any;
       
-          // Unmute is allowed here because the click IS the gesture
+          // 1. Unmute is allowed here because the click IS the gesture
           video.muted = false;
       
-          // Play first, synchronously, to consume the gesture for audio playback
+          // 2. Play first, synchronously, to consume the gesture for audio playback
           const p = video.play();
       
-          // Enter fullscreen immediately after (still same gesture tick)
+          // 3. Call webkitEnterFullscreen SYNCHRONOUSLY in the same tick.
           try {
-            if (typeof anyVideo.webkitEnterFullscreen === 'function' && metadata_ready_ref.current) {
-              anyVideo.webkitEnterFullscreen();
-            } else if (typeof anyVideo.webkitEnterFullscreen === 'function') {
-              // Metadata not ready yet — defer fullscreen to loadedmetadata, but
-              // DO NOT cross an async boundary; attach a ONE-SHOT listener.
-              const tryFs = () => {
-                try { anyVideo.webkitEnterFullscreen(); } catch {}
-                video.removeEventListener('loadedmetadata', tryFs);
-              };
-              video.addEventListener('loadedmetadata', tryFs);
+            if (typeof anyVideo.webkitEnterFullscreen === 'function') {
+                if (video.readyState >= 1) {
+                    anyVideo.webkitEnterFullscreen();
+                } else {
+                    // Metadata hasn't arrived; wait for it but keep this a ONE-SHOT
+                    const tryFs = () => {
+                        video.removeEventListener('loadedmetadata', tryFs);
+                        try { anyVideo.webkitEnterFullscreen(); } catch {}
+                    };
+                    video.addEventListener('loadedmetadata', tryFs);
+                }
             }
           } catch (e) {
             console.warn('webkitEnterFullscreen failed:', e);
           }
       
           if (p !== undefined) {
-            p.catch(() => complete_cinematic_sequence());
+            p.catch((err) => {
+                console.warn('play() rejected on iOS:', err);
+                complete_cinematic_sequence();
+            });
           }
       } else {
           // ---- DESKTOP PATH: inline playback with fallback ----
@@ -726,61 +719,54 @@ export default function App() {
       </AnimatePresence>
 
       {/* Persistent preloaded cinematic sequence layered perfectly above blackout transition */}
-      <div 
-         className={is_mobile_agent ? "" : "contents"}
-         style={is_mobile_agent ? {
-             position: 'fixed', 
-             top: 0, 
-             left: 0, 
-             width: '100vw', 
-             height: '100vh', 
-             zIndex: 999999, 
-             backgroundColor: '#000', 
-             opacity: app_lifecycle_phase === 'PLAYING_VIDEO' || app_lifecycle_phase === 'AWAITING_TRIGGER' || app_lifecycle_phase === 'PRELOADING' ? 1 : 0,
-             pointerEvents: app_lifecycle_phase !== 'PLAYING_VIDEO' ? 'none' : 'auto',
-             transition: 'opacity 0.3s ease-out'
-         } : undefined}
-      >
-          <video 
-            ref={(node) => {
-                if (video_element_reference.current !== node) {
-                    video_element_reference.current = node;
-                    if (node) {
-                        node.setAttribute('muted', '');
-                        node.defaultMuted = true;
-                        node.muted = true;
-                        if (!is_mobile_agent) {
-                            node.setAttribute('playsinline', '');
-                            node.setAttribute('webkit-playsinline', ''); 
-                        }
-                    }
-                }
-            }}
-            src={introVideo} 
-            preload={is_mobile_agent ? "metadata" : "auto"}
-            autoPlay={false}
-            {...(is_mobile_agent ? {} : { playsInline: true })}
-            onEnded={complete_cinematic_sequence}
-            onError={() => {
-                if (app_lifecycle_phase === 'PLAYING_VIDEO') {
-                    complete_cinematic_sequence();
-                }
-            }}
-            style={is_mobile_agent ? {
-               width: '100%',
-               height: '100%',
-               objectFit: 'cover',
-               opacity: app_lifecycle_phase === 'PLAYING_VIDEO' || app_lifecycle_phase === 'AWAITING_TRIGGER' || app_lifecycle_phase === 'PRELOADING' ? 1 : 0,
-               transition: 'opacity 0.1s ease-out'
-            } : { 
-                opacity: app_lifecycle_phase === 'PLAYING_VIDEO' || app_lifecycle_phase === 'AWAITING_TRIGGER' || app_lifecycle_phase === 'PRELOADING' ? 1 : 0, 
-                transition: 'opacity 0.1s ease-out', 
-                objectFit: 'cover',
-                backgroundColor: '#000'
-            }}
-            className={is_mobile_agent ? "absolute top-0 left-0" : `fixed inset-0 z-[50] w-[100vw] h-[100vh] ${app_lifecycle_phase !== 'PLAYING_VIDEO' ? 'pointer-events-none' : ''}`}
-          />
-      </div>
+      <video 
+        ref={(node) => {
+          if (video_element_reference.current !== node) {
+            video_element_reference.current = node;
+            if (node) {
+              node.setAttribute('muted', '');
+              node.defaultMuted = true;
+              node.muted = true;
+              if (!is_mobile_agent) {
+                node.setAttribute('playsinline', '');
+                node.setAttribute('webkit-playsinline', '');
+              }
+              // Force metadata load so webkitEnterFullscreen won't throw INVALID_STATE_ERR
+              try { node.load(); } catch {}
+            }
+          }
+        }}
+        src={introVideo}
+        preload="auto"
+        autoPlay={false}
+        onEnded={complete_cinematic_sequence}
+        onError={() => {
+          if (app_lifecycle_phase === 'PLAYING_VIDEO') complete_cinematic_sequence();
+        }}
+        {...(is_mobile_agent ? {} : { playsInline: true })}
+        style={is_mobile_agent ? {
+          // 1x1 off-screen stub. iOS native player will cover the screen when fullscreen is entered.
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          width: '1px',
+          height: '1px',
+          opacity: 0.01,            // NOT 0 — iOS won't load hidden videos (per WebKit policy)
+          pointerEvents: 'none',
+          zIndex: -1,
+        } : {
+          position: 'fixed',
+          inset: 0,
+          width: '100vw',
+          height: '100vh',
+          objectFit: 'cover',
+          zIndex: 50,
+          opacity: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 1 : 0,
+          pointerEvents: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 'auto' : 'none',
+          transition: 'opacity 0.3s ease-out',
+          backgroundColor: '#000',
+        }}
+      />
 
       {/* underlying three dimensional holographic representation canvas */}
       <motion.div 
