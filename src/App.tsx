@@ -55,6 +55,17 @@ export default function App() {
   const video_element_reference = useRef<HTMLVideoElement>(null);
   const has_video_played_ref = useRef<boolean>(false);
   const video_finished_ref = useRef<boolean>(false);
+  const metadata_ready_ref = useRef<boolean>(false);
+
+  useEffect(() => {
+    const v = video_element_reference.current;
+    if (!v) return;
+    const onMeta = () => { metadata_ready_ref.current = true; };
+    v.addEventListener('loadedmetadata', onMeta);
+    // Kick off metadata preload
+    v.load();
+    return () => v.removeEventListener('loadedmetadata', onMeta);
+  }, []);
 
   const complete_cinematic_sequence = React.useCallback(() => {
       if (video_finished_ref.current) return;
@@ -97,39 +108,71 @@ export default function App() {
   }, [app_lifecycle_phase]);
   
   const initiate_cinematic_sequence_via_trigger = () => {
-      if (!video_element_reference.current) {
+      const video = video_element_reference.current;
+      if (!video) {
           set_app_lifecycle_phase('VIDEO_BLACKOUT'); 
           return;
       }
 
       has_video_played_ref.current = true;
-      const video = video_element_reference.current;
 
-      set_app_lifecycle_phase('PLAYING_VIDEO');
-
-      try {
-          if (video.readyState > 0 && video.currentTime > 0) {
-              video.currentTime = 0;
+      if (is_mobile_agent) {
+          // ---- iOS PATH: native fullscreen player ----
+          const anyVideo = video as any;
+      
+          // Unmute is allowed here because the click IS the gesture
+          video.muted = false;
+      
+          // Play first, synchronously, to consume the gesture for audio playback
+          const p = video.play();
+      
+          // Enter fullscreen immediately after (still same gesture tick)
+          try {
+            if (typeof anyVideo.webkitEnterFullscreen === 'function' && metadata_ready_ref.current) {
+              anyVideo.webkitEnterFullscreen();
+            } else if (typeof anyVideo.webkitEnterFullscreen === 'function') {
+              // Metadata not ready yet — defer fullscreen to loadedmetadata, but
+              // DO NOT cross an async boundary; attach a ONE-SHOT listener.
+              const tryFs = () => {
+                try { anyVideo.webkitEnterFullscreen(); } catch {}
+                video.removeEventListener('loadedmetadata', tryFs);
+              };
+              video.addEventListener('loadedmetadata', tryFs);
+            }
+          } catch (e) {
+            console.warn('webkitEnterFullscreen failed:', e);
           }
-      } catch (e) {}
+      
+          if (p !== undefined) {
+            p.catch(() => complete_cinematic_sequence());
+          }
+      } else {
+          // ---- DESKTOP PATH: inline playback with fallback ----
+          try {
+              if (video.readyState > 0 && video.currentTime > 0) {
+                  video.currentTime = 0;
+              }
+          } catch (e) {}
 
-      // Critical: Ensure it is unmuted BEFORE playing on gesture
-      video.muted = false;
+          video.muted = false;
+          
+          const playPromise = video.play();
 
-      // 1) Call play() SYNCHRONOUSLY first inside the click handler to retain the user-gesture token.
-      const playPromise = video.play();
-
-      if (playPromise !== undefined) {
-          playPromise.catch((err) => {
-              console.warn('play() rejected:', err);
-              // Fallback for strict browser policies blocking unmuted video
-              video.muted = true;
-              video.play().catch(() => {
-                  console.warn('Fallback muted play also failed. Skipping.');
-                  complete_cinematic_sequence();
+          if (playPromise !== undefined) {
+              playPromise.catch((err) => {
+                  console.warn('play() rejected:', err);
+                  // Fallback for strict browser policies blocking unmuted video
+                  video.muted = true;
+                  video.play().catch(() => {
+                      console.warn('Fallback muted play also failed. Skipping.');
+                      complete_cinematic_sequence();
+                  });
               });
-          });
+          }
       }
+
+      // Flip React state AFTER play() so the gesture reaches play() first
+      set_app_lifecycle_phase('PLAYING_VIDEO');
   };
   
   // precompiled heavy geometries cache to obliterate main-thread rendering lag on transitions
@@ -693,16 +736,30 @@ export default function App() {
              height: '100vh', 
              zIndex: 999999, 
              backgroundColor: '#000', 
-             display: app_lifecycle_phase === 'PLAYING_VIDEO' || app_lifecycle_phase === 'AWAITING_TRIGGER' || app_lifecycle_phase === 'PRELOADING' ? 'block' : 'none',
-             pointerEvents: app_lifecycle_phase !== 'PLAYING_VIDEO' ? 'none' : 'auto' 
+             opacity: app_lifecycle_phase === 'PLAYING_VIDEO' || app_lifecycle_phase === 'AWAITING_TRIGGER' || app_lifecycle_phase === 'PRELOADING' ? 1 : 0,
+             pointerEvents: app_lifecycle_phase !== 'PLAYING_VIDEO' ? 'none' : 'auto',
+             transition: 'opacity 0.3s ease-out'
          } : undefined}
       >
           <video 
-            ref={video_element_reference}
+            ref={(node) => {
+                if (video_element_reference.current !== node) {
+                    video_element_reference.current = node;
+                    if (node) {
+                        node.setAttribute('muted', '');
+                        node.defaultMuted = true;
+                        node.muted = true;
+                        if (!is_mobile_agent) {
+                            node.setAttribute('playsinline', '');
+                            node.setAttribute('webkit-playsinline', ''); 
+                        }
+                    }
+                }
+            }}
             src={introVideo} 
-            preload="auto"
-            muted={true}
-            playsInline={true}
+            preload={is_mobile_agent ? "metadata" : "auto"}
+            autoPlay={false}
+            {...(is_mobile_agent ? {} : { playsInline: true })}
             onEnded={complete_cinematic_sequence}
             onError={() => {
                 if (app_lifecycle_phase === 'PLAYING_VIDEO') {
@@ -721,7 +778,7 @@ export default function App() {
                 objectFit: 'cover',
                 backgroundColor: '#000'
             }}
-            className={is_mobile_agent ? "" : `fixed inset-0 z-[50] w-[100vw] h-[100vh] ${app_lifecycle_phase !== 'PLAYING_VIDEO' ? 'pointer-events-none' : ''}`}
+            className={is_mobile_agent ? "absolute top-0 left-0" : `fixed inset-0 z-[50] w-[100vw] h-[100vh] ${app_lifecycle_phase !== 'PLAYING_VIDEO' ? 'pointer-events-none' : ''}`}
           />
       </div>
 
