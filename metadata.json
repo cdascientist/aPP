@@ -1,0 +1,6 @@
+{
+  "name": "Cyberpunk 3D FullPage App",
+  "description": "A single-page application with full-screen scrolling, 3D rotating shapes, web workers via Parallel.js, and a cyberpunk holographic theme.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
