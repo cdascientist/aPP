@@ -7,11 +7,10 @@
  * 2. initiating three js imports
  * 3. initiating framer motion for holographic animations
  */
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useLayoutEffect } from 'react';
 import * as THREE from 'three';
 import { motion, AnimatePresence } from 'motion/react';
 import Parallel from 'paralleljs';
-import introVideo from './1.mp4';
 
 /**
  * self descriptive interfaces for extreme clarity
@@ -56,10 +55,37 @@ export default function App() {
   const has_video_played_ref = useRef<boolean>(false);
   const video_finished_ref = useRef<boolean>(false);
 
+  // React 19 bug workaround: force muted into DOM before paint.
+  useLayoutEffect(() => {
+    const v = video_element_reference.current;
+    if (!v) return;
+    v.muted = true;
+    v.defaultMuted = true;
+    v.setAttribute('muted', '');
+    v.setAttribute('playsinline', '');
+    v.setAttribute('webkit-playsinline', '');
+  }, []);
+
+  // Warm the pipeline: start muted playback on mount
+  useEffect(() => {
+    const v = video_element_reference.current;
+    if (!v) return;
+    v.play().catch(() => {
+      // Low Power Mode fallback wrapper
+    });
+    const onError = () => {
+      console.error('VIDEO ERROR', { code: v.error?.code, message: v.error?.message });
+    };
+    v.addEventListener('error', onError);
+    return () => v.removeEventListener('error', onError);
+  }, []);
+
   const complete_cinematic_sequence = React.useCallback(() => {
-      if (video_finished_ref.current) return;
-      video_finished_ref.current = true;
-      set_app_lifecycle_phase('VIDEO_BLACKOUT');
+      set_app_lifecycle_phase((prev_phase) => {
+          if (prev_phase !== 'PLAYING_VIDEO') return prev_phase;
+          video_finished_ref.current = true;
+          return 'VIDEO_BLACKOUT';
+      });
   }, []);
 
   useEffect(() => {
@@ -95,83 +121,25 @@ export default function App() {
   }, [app_lifecycle_phase]);
   
   const initiate_cinematic_sequence_via_trigger = () => {
-      const video = video_element_reference.current;
-      
-      if (!video) { set_app_lifecycle_phase('VIDEO_BLACKOUT'); return; }
+      const v = video_element_reference.current;
+      if (!v) { set_app_lifecycle_phase('VIDEO_BLACKOUT'); return; }
 
       has_video_played_ref.current = true;
 
-      if (is_mobile_agent) {
-          // STEP 1: Force the video VISIBLE via direct DOM manipulation BEFORE play().
-          // React state updates are async — if we rely on set_app_lifecycle_phase to
-          // change the style, play() runs while opacity is still 0 and iOS rejects it.
-          video.style.opacity = '1';
-          video.style.zIndex = '9999';
-          video.style.pointerEvents = 'auto';
+      // THE critical handler. Fully synchronous. No async. No await. No setState chain into useEffect.
+      v.muted = false;
+      v.volume = 1.0;
+      v.currentTime = 0;
 
-          // STEP 2: Unmute synchronously inside the gesture.
-          video.muted = false;
+      const p = v.play();
+      set_app_lifecycle_phase('PLAYING_VIDEO');
 
-          // STEP 3: Call play() synchronously. Do NOT await.
-          const p = video.play();
-
-          // STEP 4: Call webkitEnterFullscreen() synchronously in the SAME tick so
-          // the user-gesture token is still valid. Guard for readyState >= 1 because
-          // calling it before metadata is loaded throws INVALID_STATE_ERR.
-          const anyVideo = video as any;
-          try {
-              if (typeof anyVideo.webkitEnterFullscreen === 'function') {
-                  if (video.readyState >= 1) {
-                      anyVideo.webkitEnterFullscreen();
-                  } else {
-                      const tryFs = () => {
-                          video.removeEventListener('loadedmetadata', tryFs);
-                          try { anyVideo.webkitEnterFullscreen(); } catch (e) { console.warn(e); }
-                      };
-                      video.addEventListener('loadedmetadata', tryFs);
-                  }
-              }
-          } catch (e) {
-              console.warn('webkitEnterFullscreen failed:', e);
-          }
-
-          // STEP 5: NOW update React state (after play+fullscreen have been requested).
-          set_app_lifecycle_phase('PLAYING_VIDEO');
-
-          // STEP 6: Handle play() rejection with muted fallback.
-          if (p !== undefined) {
-              p.catch((err) => {
-                  console.warn('iOS play() rejected:', err);
-                  video.muted = true;
-                  video.play().catch(() => complete_cinematic_sequence());
-              });
-          }
-      } else {
-          // ---- DESKTOP PATH: inline playback with fallback ----
-          try {
-              if (video.readyState > 0 && video.currentTime > 0) {
-                  video.currentTime = 0;
-              }
-          } catch (e) {}
-
-          video.muted = false;
-          
-          const playPromise = video.play();
-          
-          if (playPromise !== undefined) {
-              playPromise.catch((err) => {
-                  console.warn('play() rejected:', err);
-                  // Fallback for strict browser policies blocking unmuted video
-                  video.muted = true;
-                  video.play().catch(() => {
-                      console.warn('Fallback muted play also failed. Skipping.');
-                      complete_cinematic_sequence();
-                  });
-              });
-          }
-
-          // Flip React state AFTER play() so the gesture reaches play() first
-          set_app_lifecycle_phase('PLAYING_VIDEO');
+      if (p && typeof p.catch === 'function') {
+          p.catch(err => {
+              console.error('unmuted play rejected:', err.name, err.message);
+              v.muted = true;
+              v.play().catch(() => complete_cinematic_sequence());
+          });
       }
   };
   
@@ -726,77 +694,30 @@ export default function App() {
       </AnimatePresence>
 
       {/* Persistent preloaded cinematic sequence layered perfectly above blackout transition */}
-      {is_mobile_agent ? (
-        <video 
-          key="mobile-video"
-          ref={(node) => {
-            if (video_element_reference.current !== node) {
-              video_element_reference.current = node;
-              if (node) {
-                // CRITICAL: remove playsinline so iOS auto-fullscreens on play()
-                node.removeAttribute('playsinline');
-                node.removeAttribute('webkit-playsinline');
-                node.setAttribute('muted', '');
-                node.defaultMuted = true;
-                node.muted = true;
-                try { node.load(); } catch {}
-              }
-            }
-          }}
-          src={introVideo}
-          preload="auto"
-          autoPlay={false}
-          onEnded={complete_cinematic_sequence}
-          onError={() => {
-            if (app_lifecycle_phase === 'PLAYING_VIDEO') complete_cinematic_sequence();
-          }}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            width: '100vw',
-            height: '100vh',
-            objectFit: 'cover',
-            backgroundColor: '#000',
-            zIndex: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 9999 : -1,
-            opacity: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 1 : 0,
-            pointerEvents: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 'auto' : 'none',
-            transition: 'opacity 0.3s ease-out',
-          }}
-        />
-      ) : (
-        <div className="contents">
-          <video 
-            ref={(node) => {
-                video_element_reference.current = node;
-                if (node) {
-                    node.setAttribute('muted', '');
-                    node.setAttribute('playsinline', '');
-                    node.setAttribute('webkit-playsinline', ''); 
-                    node.defaultMuted = true;
-                    node.muted = true;
-                }
-            }}
-            src={introVideo}
-            preload="auto"
-            autoPlay={false}
-            playsInline={true}
-            muted={true}
-            onEnded={complete_cinematic_sequence}
-            onError={() => {
-                if (app_lifecycle_phase === 'PLAYING_VIDEO') {
-                    complete_cinematic_sequence();
-                }
-            }}
-            style={{ 
-              opacity: app_lifecycle_phase === 'PLAYING_VIDEO' || app_lifecycle_phase === 'AWAITING_TRIGGER' || app_lifecycle_phase === 'PRELOADING' ? 1 : 0, 
-              transition: 'opacity 0.1s ease-out', 
-              objectFit: 'cover', 
-              backgroundColor: '#000' 
-            }}
-            className={`fixed inset-0 z-[50] w-[100vw] h-[100vh] ${app_lifecycle_phase !== 'PLAYING_VIDEO' ? 'pointer-events-none' : ''}`}
-          />
-        </div>
-      )}
+      <video
+        ref={video_element_reference}
+        src="/1.mp4"
+        playsInline={true}
+        // @ts-expect-error — legacy prefix, harmless
+        webkit-playsinline="true"
+        muted={true}
+        autoPlay={true}
+        preload="auto"
+        onEnded={complete_cinematic_sequence}
+        onError={(e) => console.error('video onError', e)}
+        style={{
+          position: 'fixed',
+          inset: 0,
+          width: '100vw',
+          height: '100vh',
+          objectFit: 'cover',
+          background: '#000',
+          zIndex: app_lifecycle_phase === 'HOME_SCREEN' ? -1 : 50,
+          opacity: app_lifecycle_phase === 'HOME_SCREEN' ? 0 : 1,
+          transition: 'opacity 300ms ease',
+          pointerEvents: app_lifecycle_phase === 'PLAYING_VIDEO' ? 'auto' : 'none',
+        }}
+      />
 
       {/* underlying three dimensional holographic representation canvas */}
       <motion.div 
