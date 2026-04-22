@@ -102,15 +102,46 @@ export default function App() {
       has_video_played_ref.current = true;
 
       if (is_mobile_agent) {
-          set_app_lifecycle_phase('PLAYING_VIDEO');
-          // Unmute + play synchronously inside the tap gesture.
-          // iOS auto-opens native fullscreen because playsinline is absent.
+          // STEP 1: Force the video VISIBLE via direct DOM manipulation BEFORE play().
+          // React state updates are async — if we rely on set_app_lifecycle_phase to
+          // change the style, play() runs while opacity is still 0 and iOS rejects it.
+          video.style.opacity = '1';
+          video.style.zIndex = '9999';
+          video.style.pointerEvents = 'auto';
+
+          // STEP 2: Unmute synchronously inside the gesture.
           video.muted = false;
+
+          // STEP 3: Call play() synchronously. Do NOT await.
           const p = video.play();
+
+          // STEP 4: Call webkitEnterFullscreen() synchronously in the SAME tick so
+          // the user-gesture token is still valid. Guard for readyState >= 1 because
+          // calling it before metadata is loaded throws INVALID_STATE_ERR.
+          const anyVideo = video as any;
+          try {
+              if (typeof anyVideo.webkitEnterFullscreen === 'function') {
+                  if (video.readyState >= 1) {
+                      anyVideo.webkitEnterFullscreen();
+                  } else {
+                      const tryFs = () => {
+                          video.removeEventListener('loadedmetadata', tryFs);
+                          try { anyVideo.webkitEnterFullscreen(); } catch (e) { console.warn(e); }
+                      };
+                      video.addEventListener('loadedmetadata', tryFs);
+                  }
+              }
+          } catch (e) {
+              console.warn('webkitEnterFullscreen failed:', e);
+          }
+
+          // STEP 5: NOW update React state (after play+fullscreen have been requested).
+          set_app_lifecycle_phase('PLAYING_VIDEO');
+
+          // STEP 6: Handle play() rejection with muted fallback.
           if (p !== undefined) {
               p.catch((err) => {
                   console.warn('iOS play() rejected:', err);
-                  // Muted fallback — iOS always allows muted playback
                   video.muted = true;
                   video.play().catch(() => complete_cinematic_sequence());
               });
