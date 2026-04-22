@@ -53,7 +53,6 @@ export default function App() {
   const three_js_particle_system_ref = useRef<THREE.Points | null>(null);
   const animation_frame_request_id_generator = useRef<number | null>(null);
   const video_element_reference = useRef<HTMLVideoElement>(null);
-  const plyr_instance_ref = useRef<any>(null);
   const has_video_played_ref = useRef<boolean>(false);
   const video_finished_ref = useRef<boolean>(false);
 
@@ -63,44 +62,13 @@ export default function App() {
       set_app_lifecycle_phase('VIDEO_BLACKOUT');
   }, []);
 
-  // Handle Plyr setup and clean up
   useEffect(() => {
-    if (!is_mobile_agent) return;
-
-    const video = video_element_reference.current;
-    if (!video || !(window as any).Plyr) return;
-
-    plyr_instance_ref.current = new (window as any).Plyr(video, {
-      controls: [],                              // no custom chrome
-      clickToPlay: false,
-      fullscreen: {
-        enabled: true,
-        iosNative: true,                         // ← THE critical option: use iOS native fullscreen player
-        fallback: true,
-      },
-      muted: false,
-      autoplay: false,
-      hideControls: true,
-    });
-
-    return () => {
-      try { plyr_instance_ref.current?.destroy(); } catch {}
-    };
-  }, [is_mobile_agent]);
-
-  // Hook Plyr's fullscreen-exit event
-  useEffect(() => {
-    if (!is_mobile_agent) return;
-
-    const plyr = plyr_instance_ref.current;
-    if (!plyr) return;
-    const onExit = () => complete_cinematic_sequence();
-    plyr.on('exitfullscreen', onExit);
-    plyr.on('ended', onExit);
-    return () => {
-      try { plyr.off('exitfullscreen', onExit); plyr.off('ended', onExit); } catch {}
-    };
-  }, [plyr_instance_ref.current, complete_cinematic_sequence, is_mobile_agent]);
+    const v = video_element_reference.current;
+    if (!v) return;
+    const handleEnd = () => complete_cinematic_sequence();
+    v.addEventListener('webkitendfullscreen', handleEnd);
+    return () => v.removeEventListener('webkitendfullscreen', handleEnd);
+  }, [complete_cinematic_sequence, is_mobile_agent]);
 
   // Handle the seamless dark fade transition sequences
   useEffect(() => {
@@ -127,22 +95,25 @@ export default function App() {
   }, [app_lifecycle_phase]);
   
   const initiate_cinematic_sequence_via_trigger = () => {
-      const plyr = plyr_instance_ref.current;
       const video = video_element_reference.current;
       
       if (!video) { set_app_lifecycle_phase('VIDEO_BLACKOUT'); return; }
-      if (is_mobile_agent && !plyr) { set_app_lifecycle_phase('VIDEO_BLACKOUT'); return; }
 
       has_video_played_ref.current = true;
 
       if (is_mobile_agent) {
           set_app_lifecycle_phase('PLAYING_VIDEO');
-          // Plyr chains play + native iOS fullscreen inside the same gesture tick
+          // Unmute + play synchronously inside the tap gesture.
+          // iOS auto-opens native fullscreen because playsinline is absent.
           video.muted = false;
-          const p = plyr.play();
-          try { plyr.fullscreen.enter(); } catch (e) { console.warn(e); }
-          if (p && typeof p.catch === 'function') {
-              p.catch(() => complete_cinematic_sequence());
+          const p = video.play();
+          if (p !== undefined) {
+              p.catch((err) => {
+                  console.warn('iOS play() rejected:', err);
+                  // Muted fallback — iOS always allows muted playback
+                  video.muted = true;
+                  video.play().catch(() => complete_cinematic_sequence());
+              });
           }
       } else {
           // ---- DESKTOP PATH: inline playback with fallback ----
@@ -728,13 +699,22 @@ export default function App() {
         <video 
           key="mobile-video"
           ref={(node) => {
-              if (video_element_reference.current !== node) {
-                   video_element_reference.current = node;
+            if (video_element_reference.current !== node) {
+              video_element_reference.current = node;
+              if (node) {
+                // CRITICAL: remove playsinline so iOS auto-fullscreens on play()
+                node.removeAttribute('playsinline');
+                node.removeAttribute('webkit-playsinline');
+                node.setAttribute('muted', '');
+                node.defaultMuted = true;
+                node.muted = true;
+                try { node.load(); } catch {}
               }
+            }
           }}
           src={introVideo}
           preload="auto"
-          playsInline={false} /* CRITICAL on mobile — omit/false so iOS auto-fullscreens */
+          autoPlay={false}
           onEnded={complete_cinematic_sequence}
           onError={() => {
             if (app_lifecycle_phase === 'PLAYING_VIDEO') complete_cinematic_sequence();
@@ -745,11 +725,11 @@ export default function App() {
             width: '100vw',
             height: '100vh',
             objectFit: 'cover',
-            zIndex: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 9999 : -1,  /* hide behind UI until playing */
+            backgroundColor: '#000',
+            zIndex: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 9999 : -1,
             opacity: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 1 : 0,
             pointerEvents: (app_lifecycle_phase === 'PLAYING_VIDEO') ? 'auto' : 'none',
-            backgroundColor: '#000',
-            transition: 'opacity 0.3s',
+            transition: 'opacity 0.3s ease-out',
           }}
         />
       ) : (
