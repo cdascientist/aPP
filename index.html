@@ -4,6 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Holographic Cyberpunk 3D OS</title>
+    <!-- [VJS-FIX-1] Video.js 8.23.7 CDN — loaded synchronously before React bundle
+         so window.videojs is defined by the time App mounts. CSS is optional for
+         our usage (we hide default controls) but included for completeness. -->
+    <link href="https://cdn.jsdelivr.net/npm/video.js@8.23.7/dist/video-js.min.css" rel="stylesheet" />
+    <script src="https://cdn.jsdelivr.net/npm/video.js@8.23.7/dist/video.min.js"></script>
   </head>
   <body>
     <div id="root"></div>

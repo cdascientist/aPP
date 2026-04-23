@@ -12,6 +12,14 @@ import * as THREE from 'three';
 import { motion, AnimatePresence } from 'motion/react';
 import Parallel from 'paralleljs';
 
+// [VJS-FIX-2] Video.js is loaded as a global via CDN in index.html.
+// Declare the minimal shape we use so TypeScript compiles cleanly.
+declare global {
+  interface Window {
+    videojs: any;
+  }
+}
+
 /**
  * self descriptive interfaces for extreme clarity
  */
@@ -30,6 +38,8 @@ export default function App() {
   // [iOS-FIX-D] Track whether the video has loaded enough to play. Tap button
   // is disabled until this is true, preventing the readyState=0 failure mode.
   const [video_is_ready_to_play, set_video_is_ready_to_play] = useState(false);
+  const is_ios_device = useMemo(() => typeof navigator !== 'undefined' && (/iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)), []);
+  
   const [video_is_muted_due_to_browser_policy, set_video_is_muted_due_to_browser_policy] = useState(false);
   const current_active_page_index_ref = useRef<number>(0);
   const [is_telemetry_window_open, set_is_telemetry_window_open] = useState<boolean>(false);
@@ -41,6 +51,7 @@ export default function App() {
   const [dynamically_fetched_market_data_array, set_dynamically_fetched_market_data_array] = useState<{symbol: string, current_price: number}[]>([]);
   const [dynamic_browser_memory_allocation_bytes, set_dynamic_browser_memory_allocation_bytes] = useState<string>('0.00gb_sync');
   const [is_mobile_agent, set_is_mobile_agent] = useState<boolean>(false);
+  const [is_test_video_finished, set_is_test_video_finished] = useState<boolean>(false);
 
   useEffect(() => {
       set_is_mobile_agent(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
@@ -54,63 +65,20 @@ export default function App() {
   const three_js_mesh_ref = useRef<THREE.Mesh | null>(null);
   const three_js_particle_system_ref = useRef<THREE.Points | null>(null);
   const animation_frame_request_id_generator = useRef<number | null>(null);
-  const video_element_reference = useRef<HTMLVideoElement>(null);
+  const ios_video_ref = useRef<HTMLVideoElement>(null);
+  const desktop_video_ref = useRef<HTMLVideoElement>(null);
   const has_video_played_ref = useRef<boolean>(false);
   const video_finished_ref = useRef<boolean>(false);
 
   // [iOS-FIX-5] DELETED — was a workaround for React 19 muted-prop reflection
   // needed for muted autoplay. Since autoplay is removed, this hack is obsolete.
 
-  // [iOS-FIX-A] Force the video file to fetch on mount. iOS Safari ignores
-  // preload="metadata" and preload="auto" in many conditions (Low Power Mode,
-  // invisible elements, cellular). Calling v.load() explicitly forces the
-  // fetch so readyState reaches >=1 before the user can tap. Without this,
-  // the network tab shows ZERO requests for 1.mp4 and webkitEnterFullscreen()
-  // throws INVALID_STATE_ERR because metadata never loaded.
-  useEffect(() => {
-    const v = video_element_reference.current;
-    if (!v) return;
-
-    // React race condition fix: the video may already be cached and have fired loadedmetadata
-    if (v.readyState >= 1) {
-        set_video_is_ready_to_play(true);
-    }
-
-    const onLoadedMetadata = () => {
-      console.log('[iOS-FIX-A] loadedmetadata fired, readyState=', v.readyState);
-      set_video_is_ready_to_play(true); // [iOS-FIX-D]
-    };
-    const onCanPlay = () => {
-      console.log('[iOS-FIX-A] canplay fired, readyState=', v.readyState);
-    };
-    const onError = () => {
-      console.error('[iOS-FIX-A] VIDEO ERROR', {
-        code: v.error?.code,
-        message: v.error?.message,
-        src: v.currentSrc,
-      });
-    };
-    v.addEventListener('loadedmetadata', onLoadedMetadata);
-    v.addEventListener('canplay', onCanPlay);
-    v.addEventListener('error', onError);
-    // [iOS-FIX-A] Explicit load kick — this is what makes iOS actually fetch the file.
-    try { v.load(); } catch (e) { console.warn('[iOS-FIX-A] v.load() threw:', e); }
-
-    // Fallback logic: iOS Low Power Mode outright blocks preload="auto" and v.load() unconditionally.
-    // If we leave the button disabled natively, the user is permanently bricked on mobile.
-    // This securely unlocks the main button after 2.5 seconds. If the user taps it and readyState < 1,
-    // the trigger function gracefully skips the cinematic and loads the home screen!
-    const low_power_mode_fallback = setTimeout(() => {
-        set_video_is_ready_to_play(true);
-    }, 2500);
-
-    return () => {
-      clearTimeout(low_power_mode_fallback);
-      v.removeEventListener('loadedmetadata', onLoadedMetadata);
-      v.removeEventListener('canplay', onCanPlay);
-      v.removeEventListener('error', onError);
-    };
-  }, []);
+  // [VJS-FIX-3] Initialize the Video.js player on mount.
+  // Video.js handles: play-promise Promise wrapping, loadstart-based play(),
+  // muted-fallback retry on unmuted rejection, preload orchestration,
+  // and the "loadedmetadata before webkitEnterFullscreen" timing issue —
+  // all of which we were doing by hand and getting wrong.
+  const videojs_player_ref = useRef<any>(null);
 
   const complete_cinematic_sequence = React.useCallback(() => {
       set_app_lifecycle_phase((prev_phase) => {
@@ -121,12 +89,82 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const v = video_element_reference.current;
+    if (!is_ios_device) return;
+
+    const v = ios_video_ref.current;
+    if (!v || !window.videojs) {
+      console.error('[VJS-FIX-3] videojs global or video element missing');
+      return;
+    }
+
+    const player = window.videojs(v, {
+      autoplay: false,
+      muted: true, // Initially muted to allow background preloading
+      playsinline: true,
+      preload: 'auto',
+      controls: false,
+      fluid: false,
+      fill: true,
+      sources: [{ src: 'https://streamable.com/l/zeae0d/mp4.mp4', type: 'video/mp4' }],
+    });
+
+    videojs_player_ref.current = player;
+
+    player.ready(() => {
+      const markReady = () => set_video_is_ready_to_play(true);
+      if (player.readyState() >= 1) markReady();
+      else player.one('loadedmetadata', markReady);
+
+      player.on('ended', () => complete_cinematic_sequence());
+      player.on('webkitendfullscreen', () => complete_cinematic_sequence());
+      player.on('error', () => {
+        const err = player.error();
+        console.error('[VJS-FIX-3] player error:', err && err.code, err && err.message);
+      });
+    });
+
+    const low_power_mode_fallback = setTimeout(() => {
+      set_video_is_ready_to_play(true);
+    }, 2500);
+
+    return () => {
+      clearTimeout(low_power_mode_fallback);
+      try {
+        if (videojs_player_ref.current && !videojs_player_ref.current.isDisposed()) {
+          videojs_player_ref.current.dispose();
+        }
+      } catch (e) {
+        console.warn('[VJS-FIX-3] dispose threw:', e);
+      }
+      videojs_player_ref.current = null;
+    };
+  }, [is_ios_device]);
+
+  // Desktop-only warmup (restored from original)
+  useEffect(() => {
+    if (is_ios_device) return;
+    const v = desktop_video_ref.current;
     if (!v) return;
+    
+    if (v.readyState >= 1) {
+        set_video_is_ready_to_play(true);
+    }
+    
+    v.play().catch(() => {});
+    const onLoadedMetadata = () => set_video_is_ready_to_play(true);
+    v.addEventListener('loadedmetadata', onLoadedMetadata);
+    
     const handleEnd = () => complete_cinematic_sequence();
     v.addEventListener('webkitendfullscreen', handleEnd);
-    return () => v.removeEventListener('webkitendfullscreen', handleEnd);
-  }, [complete_cinematic_sequence, is_mobile_agent]);
+    
+    return () => {
+        v.removeEventListener('loadedmetadata', onLoadedMetadata);
+        v.removeEventListener('webkitendfullscreen', handleEnd);
+    };
+  }, [is_ios_device, complete_cinematic_sequence]);
+
+  // [VJS-FIX-3e] REMOVED native webkitendfullscreen listener — now handled
+  // inside player.ready() in [VJS-FIX-3] via player.on('webkitendfullscreen', ...)
 
   // Handle the seamless dark fade transition sequences
   useEffect(() => {
@@ -153,61 +191,43 @@ export default function App() {
   }, [app_lifecycle_phase]);
   
   const initiate_cinematic_sequence_via_trigger = () => {
-      const v = video_element_reference.current;
-      if (!v) { set_app_lifecycle_phase('VIDEO_BLACKOUT'); return; }
-
-      // [iOS-FIX-C1] If metadata hasn't loaded yet, DO NOT attempt fullscreen —
-      // it will throw INVALID_STATE_ERR and burn the gesture token. Instead,
-      // log loudly and short-circuit. The button should have been disabled
-      // (see Change D) but this is a belt-and-braces guard.
-      if (v.readyState < 1) {
-          console.error('[iOS-FIX-C] Tap fired but readyState=0. Video never loaded. Aborting cinematic.');
-          set_app_lifecycle_phase('VIDEO_BLACKOUT');
-          return;
-      }
-
       has_video_played_ref.current = true;
 
-      const is_ios_device = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
-          (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-
-      // [iOS-FIX-C2] Unmute synchronously inside the gesture
-      v.muted = false;
-      v.volume = 1.0;
-
       if (is_ios_device) {
-          // [iOS-FIX-C3] Synchronous iOS path — all three calls in the same gesture tick.
-          // No async, no await, no currentTime seek. Per Apple docs, webkitEnterFullscreen
-          // requires readyState>=1 (guaranteed by the guard above) AND a user gesture
-          // (guaranteed by being called directly from onClick).
-          set_app_lifecycle_phase('PLAYING_VIDEO');
-          const any_video = v as any;
-          const play_promise = v.play();
-          try {
-              if (typeof any_video.webkitEnterFullscreen === 'function') {
-                  any_video.webkitEnterFullscreen();
-              }
-          } catch (e) {
-              console.warn('[iOS-FIX-C] webkitEnterFullscreen threw:', e);
+          const player = videojs_player_ref.current;
+          if (!player || player.isDisposed()) {
+              set_app_lifecycle_phase('VIDEO_BLACKOUT');
+              return;
           }
-          if (play_promise && typeof play_promise.catch === 'function') {
-              play_promise.catch((err: any) => {
-                  console.error('[iOS-FIX-C] iOS play rejected:', err.name, err.message);
-                  complete_cinematic_sequence();
+          player.muted(false);
+          player.volume(1.0);
+          const play_promise = player.play();
+          set_app_lifecycle_phase('PLAYING_VIDEO');
+          
+          if (play_promise && typeof play_promise.then === 'function') {
+              play_promise.then(() => {}).catch(() => {
+                  player.muted(true);
+                  const retry_promise = player.play();
+                  if (retry_promise && typeof retry_promise.catch === 'function') {
+                      retry_promise.catch(() => complete_cinematic_sequence());
+                  }
               });
           }
-          return;
-      }
-
-      // [iOS-FIX-C4] Non-iOS path unchanged
-      const p = v.play();
-      set_app_lifecycle_phase('PLAYING_VIDEO');
-      if (p && typeof p.catch === 'function') {
-          p.catch(err => {
-              console.error('[iOS-FIX-C] desktop unmuted play rejected:', err.name, err.message);
-              v.muted = true;
-              v.play().catch(() => complete_cinematic_sequence());
-          });
+      } else {
+          // Pure Desktop Trigger
+          const v = desktop_video_ref.current;
+          if (!v) { set_app_lifecycle_phase('VIDEO_BLACKOUT'); return; }
+          v.muted = false;
+          v.volume = 1.0;
+          v.currentTime = 0;
+          const p = v.play();
+          set_app_lifecycle_phase('PLAYING_VIDEO');
+          if (p && typeof p.catch === 'function') {
+              p.catch(err => {
+                  v.muted = true;
+                  v.play().catch(() => complete_cinematic_sequence());
+              });
+          }
       }
   };
   
@@ -768,35 +788,59 @@ export default function App() {
       </AnimatePresence>
 
       {/* Persistent preloaded cinematic sequence layered perfectly above blackout transition */}
-      <video
-        ref={video_element_reference}
-        src="/1.mp4"
-        playsInline={true}
-        // @ts-expect-error — legacy prefix, harmless
-        webkit-playsinline="true"
-        muted={true}
-        // [iOS-FIX-3a] REMOVED autoPlay — warmup is gone, video only plays on tap.
-        // Leaving autoPlay in caused iOS to attempt (and fail) muted autoplay while
-        // the preloader overlay was covering the video, leaving the element in a
-        // partially-initialized state that broke the later tap-to-play.
-        // [iOS-FIX-B] Back to preload="auto" paired with explicit v.load() in
-        // [iOS-FIX-A]. "metadata" was preventing any fetch from happening at all.
-        preload="auto"
-        onEnded={complete_cinematic_sequence}
-        onError={(e) => console.error('video onError', e)}
-        style={{
+      {is_ios_device ? (
+        <div style={{
           position: 'fixed',
           inset: 0,
           width: '100vw',
-          height: '100vh',
-          objectFit: 'cover',
+          height: '100dvh',
           background: '#000',
-          zIndex: app_lifecycle_phase === 'HOME_SCREEN' ? -1 : 50,
-          opacity: app_lifecycle_phase === 'HOME_SCREEN' ? 0 : 1,
-          transition: 'opacity 300ms ease',
+          zIndex: (app_lifecycle_phase === 'HOME_SCREEN' || app_lifecycle_phase === 'VIDEO_BLACKOUT') ? -1 : 50,
+          opacity: (app_lifecycle_phase === 'HOME_SCREEN' || app_lifecycle_phase === 'VIDEO_BLACKOUT') ? 0 : 1,
+          transition: 'opacity 800ms ease',
           pointerEvents: app_lifecycle_phase === 'PLAYING_VIDEO' ? 'auto' : 'none',
-        }}
-      />
+        }}>
+            <div data-vjs-player style={{ width: '100%', height: '100%' }}>
+                <style>{`
+                    .vjs-cover .vjs-tech {
+                        object-fit: cover !important;
+                    }
+                `}</style>
+                <video
+                    ref={ios_video_ref}
+                    className="video-js vjs-fill vjs-cover"
+                    playsInline
+                    style={{ objectFit: 'cover' }}
+                    // @ts-expect-error — legacy iOS prefix
+                    webkit-playsinline="true"
+                    onError={(e) => console.error('[VJS-FIX-5] native video onError', e)}
+                />
+            </div>
+        </div>
+      ) : (
+          <video
+            ref={desktop_video_ref}
+            src="https://streamable.com/l/zeae0d/mp4.mp4"
+            playsInline={true}
+            // @ts-expect-error — legacy prefix, harmless
+            webkit-playsinline="true"
+            muted={true}
+            preload="auto"
+            onEnded={complete_cinematic_sequence}
+            style={{
+              position: 'fixed',
+              inset: 0,
+              width: '100vw',
+              height: '100dvh',
+              objectFit: 'cover',
+              background: '#000',
+              zIndex: (app_lifecycle_phase === 'HOME_SCREEN' || app_lifecycle_phase === 'VIDEO_BLACKOUT') ? -1 : 50,
+              opacity: (app_lifecycle_phase === 'HOME_SCREEN' || app_lifecycle_phase === 'VIDEO_BLACKOUT') ? 0 : 1,
+              transition: 'opacity 800ms ease',
+              pointerEvents: app_lifecycle_phase === 'PLAYING_VIDEO' ? 'auto' : 'none',
+            }}
+          />
+      )}
 
       {/* underlying three dimensional holographic representation canvas */}
       <motion.div 
@@ -812,18 +856,19 @@ export default function App() {
 
       {/* dynamically injected html holographic overlayer for textual elements */}
       {app_lifecycle_phase === 'HOME_SCREEN' && (
-         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center pointer-events-none p-6 md:p-12">
-            
-            <AnimatePresence mode="wait">
-               <motion.div
-                 key={current_active_full_page_index_tracker}
-                 initial={{ opacity: 0, y: 40, filter: 'blur(5px)' }}
-                 animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
-                 exit={{ opacity: 0, y: -40, filter: 'blur(5px)' }}
-                 transition={{ duration: 0.6, ease: "easeOut" }}
-                 className="max-w-4xl w-full text-center space-y-8"
-               >
-                  <motion.h1 
+         <>
+             <div className="absolute inset-0 z-10 flex flex-col items-center justify-center pointer-events-none p-6 md:p-12">
+                
+                <AnimatePresence mode="wait">
+                   <motion.div
+                     key={current_active_full_page_index_tracker}
+                     initial={{ opacity: 0, y: 40, filter: 'blur(5px)' }}
+                     animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
+                     exit={{ opacity: 0, y: -40, filter: 'blur(5px)' }}
+                     transition={{ duration: 0.6, ease: "easeOut" }}
+                     className="max-w-4xl w-full text-center space-y-8"
+                   >
+                      <motion.h1 
                      className="text-3xl md:text-5xl font-bold tracking-widest uppercase"
                      style={{ 
                         textShadow: `0 0 10px #${array_of_all_holographic_configuration_objects[current_active_full_page_index_tracker].cyberpunk_neon_color_hex.toString(16).padStart(6, '0')}`,
@@ -962,8 +1007,8 @@ export default function App() {
                   />
                ))}
             </div>
-
          </div>
+         </>
       )}
     </div>
   );
