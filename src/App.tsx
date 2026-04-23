@@ -27,6 +27,9 @@ interface holographic_data_packet_shape {
 export default function App() {
   // highly descriptive local variables in lowercase snake_case
   const [app_lifecycle_phase, set_app_lifecycle_phase] = useState<'PRELOADING' | 'AWAITING_TRIGGER' | 'PLAYING_VIDEO' | 'VIDEO_BLACKOUT' | 'HOME_SCREEN'>('PRELOADING');
+  // [iOS-FIX-D] Track whether the video has loaded enough to play. Tap button
+  // is disabled until this is true, preventing the readyState=0 failure mode.
+  const [video_is_ready_to_play, set_video_is_ready_to_play] = useState(false);
   const [video_is_muted_due_to_browser_policy, set_video_is_muted_due_to_browser_policy] = useState(false);
   const current_active_page_index_ref = useRef<number>(0);
   const [is_telemetry_window_open, set_is_telemetry_window_open] = useState<boolean>(false);
@@ -55,29 +58,58 @@ export default function App() {
   const has_video_played_ref = useRef<boolean>(false);
   const video_finished_ref = useRef<boolean>(false);
 
-  // React 19 bug workaround: force muted into DOM before paint.
-  useLayoutEffect(() => {
-    const v = video_element_reference.current;
-    if (!v) return;
-    v.muted = true;
-    v.defaultMuted = true;
-    v.setAttribute('muted', '');
-    v.setAttribute('playsinline', '');
-    v.setAttribute('webkit-playsinline', '');
-  }, []);
+  // [iOS-FIX-5] DELETED — was a workaround for React 19 muted-prop reflection
+  // needed for muted autoplay. Since autoplay is removed, this hack is obsolete.
 
-  // Warm the pipeline: start muted playback on mount
+  // [iOS-FIX-A] Force the video file to fetch on mount. iOS Safari ignores
+  // preload="metadata" and preload="auto" in many conditions (Low Power Mode,
+  // invisible elements, cellular). Calling v.load() explicitly forces the
+  // fetch so readyState reaches >=1 before the user can tap. Without this,
+  // the network tab shows ZERO requests for 1.mp4 and webkitEnterFullscreen()
+  // throws INVALID_STATE_ERR because metadata never loaded.
   useEffect(() => {
     const v = video_element_reference.current;
     if (!v) return;
-    v.play().catch(() => {
-      // Low Power Mode fallback wrapper
-    });
-    const onError = () => {
-      console.error('VIDEO ERROR', { code: v.error?.code, message: v.error?.message });
+
+    // React race condition fix: the video may already be cached and have fired loadedmetadata
+    if (v.readyState >= 1) {
+        set_video_is_ready_to_play(true);
+    }
+
+    const onLoadedMetadata = () => {
+      console.log('[iOS-FIX-A] loadedmetadata fired, readyState=', v.readyState);
+      set_video_is_ready_to_play(true); // [iOS-FIX-D]
     };
+    const onCanPlay = () => {
+      console.log('[iOS-FIX-A] canplay fired, readyState=', v.readyState);
+    };
+    const onError = () => {
+      console.error('[iOS-FIX-A] VIDEO ERROR', {
+        code: v.error?.code,
+        message: v.error?.message,
+        src: v.currentSrc,
+      });
+    };
+    v.addEventListener('loadedmetadata', onLoadedMetadata);
+    v.addEventListener('canplay', onCanPlay);
     v.addEventListener('error', onError);
-    return () => v.removeEventListener('error', onError);
+    // [iOS-FIX-A] Explicit load kick — this is what makes iOS actually fetch the file.
+    try { v.load(); } catch (e) { console.warn('[iOS-FIX-A] v.load() threw:', e); }
+
+    // Fallback logic: iOS Low Power Mode outright blocks preload="auto" and v.load() unconditionally.
+    // If we leave the button disabled natively, the user is permanently bricked on mobile.
+    // This securely unlocks the main button after 2.5 seconds. If the user taps it and readyState < 1,
+    // the trigger function gracefully skips the cinematic and loads the home screen!
+    const low_power_mode_fallback = setTimeout(() => {
+        set_video_is_ready_to_play(true);
+    }, 2500);
+
+    return () => {
+      clearTimeout(low_power_mode_fallback);
+      v.removeEventListener('loadedmetadata', onLoadedMetadata);
+      v.removeEventListener('canplay', onCanPlay);
+      v.removeEventListener('error', onError);
+    };
   }, []);
 
   const complete_cinematic_sequence = React.useCallback(() => {
@@ -124,19 +156,55 @@ export default function App() {
       const v = video_element_reference.current;
       if (!v) { set_app_lifecycle_phase('VIDEO_BLACKOUT'); return; }
 
+      // [iOS-FIX-C1] If metadata hasn't loaded yet, DO NOT attempt fullscreen —
+      // it will throw INVALID_STATE_ERR and burn the gesture token. Instead,
+      // log loudly and short-circuit. The button should have been disabled
+      // (see Change D) but this is a belt-and-braces guard.
+      if (v.readyState < 1) {
+          console.error('[iOS-FIX-C] Tap fired but readyState=0. Video never loaded. Aborting cinematic.');
+          set_app_lifecycle_phase('VIDEO_BLACKOUT');
+          return;
+      }
+
       has_video_played_ref.current = true;
 
-      // THE critical handler. Fully synchronous. No async. No await. No setState chain into useEffect.
+      const is_ios_device = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+          (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+      // [iOS-FIX-C2] Unmute synchronously inside the gesture
       v.muted = false;
       v.volume = 1.0;
-      v.currentTime = 0;
 
+      if (is_ios_device) {
+          // [iOS-FIX-C3] Synchronous iOS path — all three calls in the same gesture tick.
+          // No async, no await, no currentTime seek. Per Apple docs, webkitEnterFullscreen
+          // requires readyState>=1 (guaranteed by the guard above) AND a user gesture
+          // (guaranteed by being called directly from onClick).
+          set_app_lifecycle_phase('PLAYING_VIDEO');
+          const any_video = v as any;
+          const play_promise = v.play();
+          try {
+              if (typeof any_video.webkitEnterFullscreen === 'function') {
+                  any_video.webkitEnterFullscreen();
+              }
+          } catch (e) {
+              console.warn('[iOS-FIX-C] webkitEnterFullscreen threw:', e);
+          }
+          if (play_promise && typeof play_promise.catch === 'function') {
+              play_promise.catch((err: any) => {
+                  console.error('[iOS-FIX-C] iOS play rejected:', err.name, err.message);
+                  complete_cinematic_sequence();
+              });
+          }
+          return;
+      }
+
+      // [iOS-FIX-C4] Non-iOS path unchanged
       const p = v.play();
       set_app_lifecycle_phase('PLAYING_VIDEO');
-
       if (p && typeof p.catch === 'function') {
           p.catch(err => {
-              console.error('unmuted play rejected:', err.name, err.message);
+              console.error('[iOS-FIX-C] desktop unmuted play rejected:', err.name, err.message);
               v.muted = true;
               v.play().catch(() => complete_cinematic_sequence());
           });
@@ -650,10 +718,16 @@ export default function App() {
                      <button 
                          key="initiate-trigger"
                          onClick={initiate_cinematic_sequence_via_trigger}
-                         className="bg-transparent border border-[var(--hologram-cyan)] text-[var(--hologram-cyan)] px-8 py-4 w-full hover:bg-[var(--hologram-cyan)] hover:text-black transition-colors cursor-pointer text-[13px] font-bold tracking-[0.2em] uppercase shadow-[0_0_20px_rgba(0,243,255,0.4)] animate-pulse"
+                         disabled={!video_is_ready_to_play} // [iOS-FIX-D]
+                         className={`bg-transparent border text-[var(--hologram-cyan)] px-8 py-4 w-full transition-colors cursor-pointer text-[13px] font-bold tracking-[0.2em] uppercase ${
+                             video_is_ready_to_play
+                                 ? 'border-[var(--hologram-cyan)] hover:bg-[var(--hologram-cyan)] hover:text-black shadow-[0_0_20px_rgba(0,243,255,0.4)] animate-pulse'
+                                 : 'border-[rgba(0,243,255,0.2)] opacity-40 cursor-wait'
+                         }`}
                          style={{ WebkitTapHighlightColor: 'transparent' }}
                      >
-                         TAP TO INITIATE MAINFRAME
+                         {/* [iOS-FIX-D] Label reflects readiness so the user knows why the button is disabled */}
+                         {video_is_ready_to_play ? 'TAP TO INITIATE MAINFRAME' : 'BUFFERING MAINFRAME...'}
                      </button>
                  </div>
              ) : (
@@ -701,7 +775,12 @@ export default function App() {
         // @ts-expect-error — legacy prefix, harmless
         webkit-playsinline="true"
         muted={true}
-        autoPlay={true}
+        // [iOS-FIX-3a] REMOVED autoPlay — warmup is gone, video only plays on tap.
+        // Leaving autoPlay in caused iOS to attempt (and fail) muted autoplay while
+        // the preloader overlay was covering the video, leaving the element in a
+        // partially-initialized state that broke the later tap-to-play.
+        // [iOS-FIX-B] Back to preload="auto" paired with explicit v.load() in
+        // [iOS-FIX-A]. "metadata" was preventing any fetch from happening at all.
         preload="auto"
         onEnded={complete_cinematic_sequence}
         onError={(e) => console.error('video onError', e)}
